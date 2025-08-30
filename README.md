@@ -1,4 +1,3 @@
-Awesome—here’s a complete, copy-pasteable README.md you can drop in your repo. It’s written step-by-step so you can run the whole thing end-to-end and explain it confidently.
 
 # README.md
 
