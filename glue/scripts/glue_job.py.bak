@@ -1,0 +1,145 @@
+# glue/scripts/glue_job.py
+import sys
+import json
+import time
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, to_timestamp, round as spark_round
+from pyspark.sql.types import IntegerType, DoubleType
+import boto3
+
+args = getResolvedOptions(sys.argv, [
+    "JOB_NAME",
+    "raw_bucket",
+    "raw_prefix",
+    "processed_bucket",
+    "processed_prefix",
+    "redshift_workgroup",
+    "redshift_db",
+    "redshift_secret_arn",
+    "redshift_iam_role_arn",
+    "TempDir"
+])
+
+raw_path = f"s3://{args['raw_bucket']}{args['raw_prefix']}"
+processed_path = f"s3://{args['processed_bucket']}{args['processed_prefix']}"
+
+spark = SparkSession.builder.appName("batch-etl-sales").getOrCreate()
+
+# 1) Read CSV from S3 (raw zone)
+df = (
+    spark.read
+    .option("header", True)
+    .option("inferSchema", True)
+    .csv(raw_path)
+)
+
+# 2) Cast types and compute revenue
+df = (
+    df
+    .withColumn("order_id", col("order_id").cast(IntegerType()))
+    .withColumn("customer_id", col("customer_id").cast(IntegerType()))
+    .withColumn("product_id", col("product_id").cast(IntegerType()))
+    .withColumn("quantity", col("quantity").cast(IntegerType()))
+    .withColumn("unit_price", col("unit_price").cast(DoubleType()))
+    .withColumn("order_timestamp", to_timestamp(col("order_timestamp")))
+)
+
+df = df.withColumn("revenue", spark_round(col("quantity") * col("unit_price"), 2))
+
+# 3) Write Parquet to processed
+(
+    df.coalesce(1)
+      .write
+      .mode("overwrite")
+      .parquet(processed_path)
+)
+
+# 4) Load into Redshift using Data API (COPY PARQUET)
+workgroup     = args["redshift_workgroup"]
+database      = args["redshift_db"]
+secret_arn    = args["redshift_secret_arn"]
+iam_role_arn  = args["redshift_iam_role_arn"]
+
+rsd = boto3.client("redshift-data")
+
+def exec_sql(sql):
+    resp = rsd.execute_statement(
+        WorkgroupName=workgroup,
+        Database=database,
+        SecretArn=secret_arn,
+        Sql=sql
+    )
+    sid = resp["Id"]
+    while True:
+        d = rsd.describe_statement(Id=sid)
+        status = d["Status"]
+        if status in ("FINISHED", "FAILED", "ABORTED"):
+            if status != "FINISHED":
+                raise RuntimeError(f"SQL failed: {sql}\n{json.dumps(d, indent=2, default=str)}")
+            break
+        time.sleep(2)
+    return sid
+
+def fetch_json(sid):
+    res = rsd.get_statement_result(Id=sid)
+    cols = [c["name"] for c in res["ColumnMetadata"]]
+    out = []
+    for row in res.get("Records", []):
+        item = {}
+        for name, cell in zip(cols, row):
+            if "longValue" in cell:
+                item[name] = cell["longValue"]
+            elif "doubleValue" in cell:
+                item[name] = cell["doubleValue"]
+            elif "stringValue" in cell:
+                item[name] = cell["stringValue"]
+            elif "booleanValue" in cell:
+                item[name] = cell["booleanValue"]
+            elif "isNull" in cell and cell["isNull"]:
+                item[name] = None
+            else:
+                v = next(iter(cell.values()))
+                item[name] = v
+        out.append(item)
+    return out
+
+# Create schema/table idempotently
+exec_sql("create schema if not exists sales;")
+
+exec_sql("""create table if not exists sales.sales_fact (
+    order_id        integer,
+    customer_id     integer,
+    product_id      integer,
+    quantity        integer,
+    unit_price      decimal(10,2),
+    revenue         decimal(12,2),
+    order_timestamp timestamp
+);
+""")
+
+# Truncate then COPY from S3 Parquet
+exec_sql("truncate table sales.sales_fact;")
+
+copy_sql = f"""copy sales.sales_fact
+from 's3://{args['processed_bucket']}/{args['processed_prefix']}'
+iam_role '{iam_role_arn}'
+format as parquet;
+"""
+exec_sql(copy_sql)
+
+# Validation queries
+sid_count = exec_sql("select count(*) as row_count from sales.sales_fact;")
+count_res = fetch_json(sid_count)
+
+sid_rev = exec_sql("""select cast(order_timestamp as date) as order_date, sum(revenue) as total_revenue
+from sales.sales_fact
+group by 1
+order by 1;
+""")
+rev_res = fetch_json(sid_rev)
+
+print(json.dumps({
+    "load_summary": count_res[0] if count_res else {},
+    "revenue_by_date": rev_res
+}, indent=2, default=str))
