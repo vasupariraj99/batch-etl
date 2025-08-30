@@ -1,11 +1,23 @@
+# macOS
 .DS_Store
+
+# Python
 __pycache__/
 *.pyc
 .venv/
 .env
+
+# Terraform
 .terraform/
 terraform.tfstate
 terraform.tfstate.*
 crash.log
+*.lock.hcl
+
+# Local outputs / logs
 out/
 *.log
+
+# IDE
+.vscode/
+.idea/
